@@ -23,6 +23,21 @@ from typing import Optional
 import numpy as np
 import torch
 
+def _parse_routes_per_micron(plc_file: Path) -> tuple[float, float]:
+    """Pull H/V routes-per-micron out of a .plc file header."""
+    h, v = 0.0, 0.0
+    with open(plc_file) as f:
+        for line in f:
+            if "ROUTES PER MICRON" in line:
+                # Format: "#[ROUTES PER MICRON] Hor: 65.96, Ver: 106.96"
+                import re
+                m = re.search(r"Hor:\s*([\d.]+),\s*Ver:\s*([\d.]+)", line)
+                if m:
+                    h, v = float(m.group(1)), float(m.group(2))
+                    break
+            if not line.startswith("#"):
+                break  # past the header
+    return h, v
 
 # ---------------------------------------------------------------------------
 # Locate TILOS sources
@@ -128,13 +143,6 @@ class BenchmarkBundle:
         return torch.tensor(positions, dtype=torch.float32)
 
     def apply_placement(self, placement: torch.Tensor) -> None:
-        """
-        Write a placement back to the TILOS evaluator.
-
-        `placement` is expected to be shape [num_hard + num_soft, 2] with the
-        same ordering as `current_placement()` returns — hard macros first,
-        soft macros second.
-        """
         all_indices = self.hard_indices + self.soft_indices
         assert placement.shape[0] == len(all_indices), (
             f"placement has {placement.shape[0]} rows but expected "
@@ -143,10 +151,8 @@ class BenchmarkBundle:
         for k, idx in enumerate(all_indices):
             x = float(placement[k, 0])
             y = float(placement[k, 1])
-            # TILOS PlacementCost uses node names for update_node_coords;
-            # the modules_w_pins list is parallel-indexed, so we go via name.
-            name = self.plc.get_node_name(idx)
-            self.plc.update_node_coords(name, x, y)
+            # TILOS uses module indices directly here.
+            self.plc.update_node_coords(idx, x, y)
 
 
 # ---------------------------------------------------------------------------
@@ -177,17 +183,13 @@ def load_benchmark(
     # Import TILOS plc reader lazily so the rest of the package is importable
     # even before TILOS is wired up.
     try:
-        from plc_client import plc_client_os as plc_client  # vendored binding
-    except ImportError:
-        try:
-            # alternate import path used by some packagings
-            from circuit_training.environment import plc_client  # type: ignore
-        except ImportError as e:
-            raise ImportError(
-                "Could not import TILOS PlacementCost bindings. "
-                "Set TILOS_MACRO_PLACEMENT_ROOT or vendor the MacroPlacement "
-                "repo at benchmarks/external/MacroPlacement/."
-            ) from e
+        import plc_client_os as plc_client  # the actual TILOS module name
+    except ImportError as e:
+        raise ImportError(
+            "Could not import TILOS PlacementCost bindings (plc_client_os). "
+            "Make sure benchmarks/external/MacroPlacement/CodeElements/Plc_client "
+            "is on sys.path, or set TILOS_MACRO_PLACEMENT_ROOT."
+        ) from e
 
     netlist_pb = benchmark_dir / "netlist.pb.txt"
     plc_file = next(benchmark_dir.glob("*.plc"), None)
@@ -203,6 +205,12 @@ def load_benchmark(
     )
     plc.set_canvas_boundary_check(True)
     plc.restore_placement(str(plc_file))
+
+    # TILOS doesn't always pick up routes_per_micron from the .plc header on
+    # restore. Read it directly and set explicitly so congestion is defined.
+    h_routes, v_routes = _parse_routes_per_micron(plc_file)
+    if h_routes and v_routes:
+        plc.set_routes_per_micron(h_routes, v_routes)
 
     # Catalogue modules
     hard_indices = list(plc.hard_macro_indices)
